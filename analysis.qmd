@@ -1,0 +1,157 @@
+---
+title: "Wildfires and Movies"
+format: html
+author: "Andrew Lucas"
+execute:
+  echo: false
+---
+
+```{r}
+#| message: false
+#| label: setup
+library(tidyverse)
+library(purrr)
+library(leaflet)
+library(rvest)
+library(httr2)
+library(jsonlite)
+```
+
+```{r}
+raw <- fromJSON("data/wildfires.geojson", simplifyVector = FALSE)
+length(raw$features)
+```
+
+```{r}
+fire <- raw$features[[1]]
+names(fire)
+
+fire$geometry$coordinates[[1]][[1]]
+```
+
+```{r}
+features <- tibble(features = raw$features)
+print(features)
+
+features |> unnest_wider(features)
+
+features |>
+  unnest_wider(features) |>
+  unnest_wider(properties)
+```
+
+```{r}
+#| cache: true
+fires <- features |>
+  unnest_wider(features) |>
+  unnest_wider(properties) |>
+  unnest_wider(geometry, names_sep = "_") |>
+  select(incident, gis_acres, fire_year, agency, state, geometry_coordinates) |>
+  mutate(
+    gis_acres = as.numeric(gis_acres),
+    fire_year = as.integer(fire_year)
+  )
+```
+
+```{r}
+fires |>
+  filter(str_detect(incident, "August")) |>
+  nrow()
+
+fires |>
+  slice_max(gis_acres, n = 10)
+
+ggplot(fires, aes(x = gis_acres)) +
+  geom_histogram() +
+  scale_x_log10()
+
+fires |>
+  group_by(fire_year) |>
+  summarize(total_acres = sum(gis_acres, na.rm = TRUE)) |>
+  ggplot(aes(x = fire_year, y = total_acres)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Total Acres Burned per Year",
+    x = "Fire Year",
+    y = "Total Acres Burned",
+    caption = "Total reported GIS acres by fire year."
+  )
+
+fires |>
+  group_by(state) |>
+  summarize(total_acres = sum(gis_acres, na.rm = TRUE)) |>
+  arrange(desc(total_acres)) |>
+  slice_head(n = 10)
+```
+
+```{r}
+big_fires <- fires |>
+  filter(gis_acres >= 100000)
+
+big_fires <- big_fires |>
+  mutate(
+    lon = map_dbl(geometry_coordinates, \(coordinates) {
+      mean(map_dbl(coordinates[[1]], 1))
+    }),
+    lat = map_dbl(geometry_coordinates, \(coordinates) {
+      mean(map_dbl(coordinates[[1]], 2))
+    })
+  )
+```
+
+```{r}
+big_fires |>
+  count(agency) |>
+  ggplot(aes(x = reorder(agency, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Number of Big Fires by Managing Agency",
+    x = "Managing Agency",
+    y = "Number of Big Fires"
+  )
+```
+
+```{r}
+largest_fires <- big_fires |>
+  slice_max(gis_acres, n = 10)
+
+largest_fires <- largest_fires |>
+  mutate(
+    polygon_lng = map(geometry_coordinates, \(coordinates) {
+      map_dbl(coordinates[[1]], 1)
+    }),
+    polygon_lat = map(geometry_coordinates, \(coordinates) {
+      map_dbl(coordinates[[1]], 2)
+    }),
+    geometry = map2(polygon_lng, polygon_lat, \(longitude, latitude) {
+      sf::st_polygon(list(cbind(longitude, latitude)))
+    })
+  )
+largest_fires$geometry <- sf::st_sfc(largest_fires$geometry, crs = 4326)
+largest_fires <- sf::st_as_sf(largest_fires)
+
+map_bounds <- list(
+  lng1 = min(unlist(largest_fires$polygon_lng)),
+  lat1 = min(unlist(largest_fires$polygon_lat)),
+  lng2 = max(unlist(largest_fires$polygon_lng)),
+  lat2 = max(unlist(largest_fires$polygon_lat))
+)
+
+leaflet(largest_fires) |>
+  addTiles() |>
+  addPolygons(
+    popup = ~paste0(
+      "<strong>", incident, "</strong><br>",
+      "Year: ", fire_year, "<br>",
+      "Acres: ", format(gis_acres, big.mark = ",")
+    )
+  ) |>
+  fitBounds(
+    lng1 = map_bounds$lng1,
+    lat1 = map_bounds$lat1,
+    lng2 = map_bounds$lng2,
+    lat2 = map_bounds$lat2
+  )
+```
