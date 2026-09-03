@@ -62,14 +62,14 @@ fires |>
   slice_max(gis_acres, n = 10)
 
 ggplot(fires, aes(x = gis_acres)) +
-  geom_histogram() +
+  geom_histogram(bins = 30) +
   scale_x_log10()
 
-fires |>
+yearly_acres <- fires |>
   group_by(fire_year) |>
-  summarize(total_acres = sum(gis_acres, na.rm = TRUE)) |>
-  ggplot(aes(x = fire_year, y = total_acres)) +
-  geom_line() +
+  summarize(total_acres = sum(gis_acres, na.rm = TRUE))
+
+yearly_plot <- ggplot(yearly_acres, aes(x = fire_year, y = total_acres)) +
   geom_point() +
   labs(
     title = "Total Acres Burned per Year",
@@ -77,6 +77,12 @@ fires |>
     y = "Total Acres Burned",
     caption = "Total reported GIS acres by fire year."
   )
+
+if (nrow(yearly_acres) > 1) {
+  yearly_plot <- yearly_plot + geom_line()
+}
+
+yearly_plot
 
 fires |>
   group_by(state) |>
@@ -132,26 +138,205 @@ largest_fires <- largest_fires |>
 largest_fires$geometry <- sf::st_sfc(largest_fires$geometry, crs = 4326)
 largest_fires <- sf::st_as_sf(largest_fires)
 
-map_bounds <- list(
-  lng1 = min(unlist(largest_fires$polygon_lng)),
-  lat1 = min(unlist(largest_fires$polygon_lat)),
-  lng2 = max(unlist(largest_fires$polygon_lng)),
-  lat2 = max(unlist(largest_fires$polygon_lat))
+if (nrow(largest_fires) > 0) {
+  map_bounds <- list(
+    lng1 = min(unlist(largest_fires$polygon_lng)),
+    lat1 = min(unlist(largest_fires$polygon_lat)),
+    lng2 = max(unlist(largest_fires$polygon_lng)),
+    lat2 = max(unlist(largest_fires$polygon_lat))
+  )
+
+  leaflet(largest_fires) |>
+    addTiles() |>
+    addPolygons(
+      popup = ~paste0(
+        "<strong>", incident, "</strong><br>",
+        "Year: ", fire_year, "<br>",
+        "Acres: ", format(gis_acres, big.mark = ",")
+      )
+    ) |>
+    fitBounds(
+      lng1 = map_bounds$lng1,
+      lat1 = map_bounds$lat1,
+      lng2 = map_bounds$lng2,
+      lat2 = map_bounds$lat2
+    )
+} else {
+  leaflet() |>
+    addTiles() |>
+    setView(lng = -115, lat = 40, zoom = 4)
+}
+```
+
+```{r}
+imdb_snapshots <- readRDS("data/imdb_snapshots.rds") |>
+  as_tibble()
+
+print(imdb_snapshots)
+
+imdb_snapshots |>
+  count(snapshot_year)
+```
+
+```{r}
+imdb_snapshots <- imdb_snapshots |>
+  mutate(release_decade = (release_year %/% 10) * 10)
+
+imdb_snapshots |>
+  group_by(release_decade) |>
+  summarize(average_rank_change = mean(rank_change, na.rm = TRUE)) |>
+  arrange(release_decade)
+```
+
+```{r}
+nolan_films <- c(
+  "The Dark Knight", "Inception", "Interstellar",
+  "The Dark Knight Rises", "Memento", "The Prestige", "Batman Begins"
 )
 
-leaflet(largest_fires) |>
-  addTiles() |>
-  addPolygons(
-    popup = ~paste0(
-      "<strong>", incident, "</strong><br>",
-      "Year: ", fire_year, "<br>",
-      "Acres: ", format(gis_acres, big.mark = ",")
+imdb_snapshots |>
+  filter(title %in% nolan_films) |>
+  select(title, snapshot_year, rank) |>
+  pivot_wider(
+    names_from = snapshot_year,
+    values_from = rank
+  )
+```
+
+```{r}
+imdb_snapshots |>
+  filter(title == "Interstellar") |>
+  ggplot(aes(x = snapshot_year, y = rank)) +
+  geom_col() +
+  labs(
+    title = "Interstellar Rank by Snapshot Year",
+    x = "Snapshot Year",
+    y = "IMDb Rank"
+  )
+```
+
+```{r}
+film_snapshot_counts <- imdb_snapshots |>
+  filter(title %in% nolan_films) |>
+  distinct(title, snapshot_year) |>
+  count(title, name = "snapshot_count")
+
+film_snapshot_counts |>
+  count(snapshot_count, name = "number_of_films") |>
+  ggplot(aes(x = snapshot_count, y = number_of_films)) +
+  geom_col() +
+  labs(
+    title = "Distribution of Film Snapshot Appearances",
+    x = "Number of Snapshots",
+    y = "Number of Films"
+  )
+```
+
+```{r}
+#| cache: true
+years <- c(2015, 2017, 2019, 2021, 2022)
+addresses <- c(
+  "https://web.archive.org/web/20150101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20170101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20190101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20210101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20220201012049/https://www.imdb.com/chart/top/"
+)
+
+scrape_imdb <- function(address, snap_year) {
+  page <- tryCatch(
+    request(address) |>
+      req_timeout(120) |>
+      req_retry(max_tries = 3) |>
+      req_perform() |>
+      resp_body_html(),
+    error = \(error) NULL
+  )
+
+  if (is.null(page)) {
+    return(tibble(
+      snap_year = integer(),
+      rank = integer(),
+      title = character(),
+      year = integer(),
+      rating = numeric(),
+      number = numeric()
+    ))
+  }
+
+  table <- page |>
+    html_table() |>
+    pluck(1)
+
+  numbers <- page |>
+    html_elements("[title*='votes']") |>
+    html_attr("title") |>
+    str_extract("(?<=based on )[0-9,]+") |>
+    parse_number()
+
+  if (length(numbers) != nrow(table)) {
+    numbers <- rep(NA_real_, nrow(table))
+  }
+
+  tibble(
+    rank_title = table[["Rank & Title"]],
+    rating = parse_number(as.character(table[["IMDb Rating"]])),
+    number = numbers
+  ) |>
+    separate_wider_regex(
+      rank_title,
+      patterns = c(
+        rank = "[0-9]+",
+        "\\.\\s+",
+        title = ".+",
+        "\\s+\\(",
+        year = "[0-9]{4}",
+        "\\)"
+      )
+    ) |>
+    mutate(
+      snap_year = snap_year,
+      rank = as.integer(rank),
+      year = as.integer(year)
+    ) |>
+    select(snap_year, rank, title, year, rating, number)
+}
+
+imdb_snapshots <- map2(addresses, years, scrape_imdb) |>
+  list_rbind()
+```
+
+```{r}
+imdb_snapshots |>
+  filter(snap_year %in% c(2015, 2022)) |>
+  select(title, year, snap_year, rank) |>
+  pivot_wider(names_from = snap_year, values_from = rank, names_prefix = "rank_") |>
+  drop_na(rank_2015, rank_2022) |>
+  mutate(
+    rank_change = rank_2022 - rank_2015,
+    release_decade = (year %/% 10) * 10
+  ) |>
+  group_by(release_decade) |>
+  summarize(average_rank_change = mean(rank_change, na.rm = TRUE)) |>
+  mutate(
+    direction = case_when(
+      average_rank_change > 0 ~ "Rose",
+      average_rank_change < 0 ~ "Fell",
+      TRUE ~ "No change"
     )
   ) |>
-  fitBounds(
-    lng1 = map_bounds$lng1,
-    lat1 = map_bounds$lat1,
-    lng2 = map_bounds$lng2,
-    lat2 = map_bounds$lat2
+  ggplot(aes(x = average_rank_change, y = factor(release_decade), fill = direction)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_manual(
+    values = c(Rose = "#C44E52", Fell = "#4C78A8", `No change` = "#999999")
+  ) +
+  labs(
+    title = "Average Rank Change by Release Decade",
+    subtitle = "IMDb rank change from the 2015 snapshot to the 2022 snapshot",
+    x = "Average Rank Change",
+    y = "Release Decade",
+    fill = "Rank direction",
+    caption = "Sample: 190 films appearing in both the 2015 and 2022 snapshots."
   )
 ```
